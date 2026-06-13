@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlfoundations"
+version = "0.1.0"
+description = "Phase 1 — from-scratch RL foundations for the physics-based humanoid locomotion project"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",                              # CPU build on Windows by default
+    "gymnasium[classic-control,mujoco]",
+    "numpy",
+    "wandb",
+    "matplotlib",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+include = ["rlfoundations*"]
