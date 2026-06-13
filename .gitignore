@@ -1,0 +1,37 @@
+# =============================================================
+#  Physics-Based Animation & Humanoid Locomotion
+# =============================================================
+
+# --- Local-only reference material — DO NOT PUBLISH ---
+# Transcriptions of copyrighted course material (UCSD CSE169, S. Rotenberg)
+# and annotated papers. Kept in the repo for local reference only.
+notes/
+papers/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- ML / experiment artifacts (track via Releases / Git LFS / DVC if needed) ---
+data/
+wandb/
+runs/
+logs/
+outputs/
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
