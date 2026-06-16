@@ -64,6 +64,7 @@ class PPOAgent:
         clip_vloss: bool = True,
         orthogonal_init: bool = True,
         normalize_obs: bool = False,
+        normalize_reward: bool = False,
         device: str = "cpu",
     ) -> None:
         self.gamma = gamma
@@ -80,6 +81,8 @@ class PPOAgent:
         self.action_dim = action_dim
         self.normalize_obs = normalize_obs
         self.obs_rms = RunningMeanStd((obs_dim,)) if normalize_obs else None
+        self.normalize_reward = normalize_reward
+        self.return_rms = RunningMeanStd(()) if normalize_reward else None
         self.device = torch.device(device)
 
         if continuous:
@@ -247,6 +250,7 @@ class PPOAgent:
         if self._next_obs is None:
             self._next_obs = np.stack([env.reset()[0] for env in envs]).astype(np.float32)
             self._next_done = np.zeros(n_envs, dtype=np.float32)
+            self._ret_acc = np.zeros(n_envs, dtype=np.float64)  # discounted-return accumulator (reward norm)
 
         obs_buf = np.zeros((num_steps, n_envs, obs_dim), dtype=np.float32)
         if self.continuous:
@@ -282,8 +286,16 @@ class PPOAgent:
                 # env's [-1, 1] box (we store the UNCLIPPED action for the log-prob)
                 step_action = np.clip(actions[i], -1.0, 1.0) if self.continuous else int(actions[i])
                 next_obs_i, reward, terminated, truncated, _ = env.step(step_action)
+                ep_return[i] += reward  # RAW reward for logging (eval/train returns stay in real scale)
+
+                # reward normalization: divide by a running std of the discounted return
+                # (gym/CleanRL convention) — pulls the value/return scale to ~O(1) so the
+                # critic targets, GAE, and the 0.2 value-clip all live on a sane scale.
+                if self.normalize_reward:
+                    self._ret_acc[i] = self.gamma * self._ret_acc[i] + reward
+                    self.return_rms.update(np.array([self._ret_acc[i]]))
+                    reward = float(np.clip(reward / np.sqrt(self.return_rms.var + 1e-8), -10.0, 10.0))
                 rewards_buf[t, i] = reward
-                ep_return[i] += reward
 
                 # Per-env truncation bootstrap (same fix as single-env): a time-limit
                 # truncation is NOT a real terminal, so fold gamma * V(s_T) into the
@@ -297,6 +309,7 @@ class PPOAgent:
                 if done:
                     ep_returns.append(float(ep_return[i]))
                     ep_return[i] = 0.0
+                    self._ret_acc[i] = 0.0  # reset discounted-return accumulator at episode end
                     next_obs_i, _ = env.reset()
 
                 self._next_obs[i] = next_obs_i

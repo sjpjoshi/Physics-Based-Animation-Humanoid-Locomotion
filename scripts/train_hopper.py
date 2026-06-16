@@ -45,6 +45,7 @@ ANNEAL_LR = True
 CLIP_VLOSS = True
 ORTHOGONAL_INIT = True
 NORMALIZE_OBS = True         # running mean/std on observations — high-impact for MuJoCo
+NORMALIZE_REWARD = True      # running std of the discounted return — pulls returns to ~O(1)
 
 EVAL_EVERY_ITERS = 10
 EVAL_EPISODES = 10
@@ -95,6 +96,7 @@ def main() -> None:
         clip_vloss=CLIP_VLOSS,
         orthogonal_init=ORTHOGONAL_INIT,
         normalize_obs=NORMALIZE_OBS,
+        normalize_reward=NORMALIZE_REWARD,
     )
 
     num_iterations = TOTAL_TIMESTEPS // (NUM_STEPS * NUM_ENVS)
@@ -120,6 +122,7 @@ def main() -> None:
         "clip_vloss": CLIP_VLOSS,
         "orthogonal_init": ORTHOGONAL_INIT,
         "normalize_obs": NORMALIZE_OBS,
+        "normalize_reward": NORMALIZE_REWARD,
     }
 
     with Logger("rlfoundations", config, run_name="ppo-hopper") as logger:
