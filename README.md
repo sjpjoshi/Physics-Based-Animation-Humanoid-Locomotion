@@ -2,7 +2,12 @@
 
 Building a physics-based humanoid that learns to imitate motion-capture clips with deep reinforcement learning — a from-scratch implementation in the spirit of [DeepMimic](https://xbpeng.github.io/projects/DeepMimic/) (Peng et al. 2018).
 
-**Status:** Phase 1 (RL foundations) — environment setup.
+<p align="center">
+  <img src="media/hopper.gif" alt="PPO-trained MuJoCo Hopper" width="320"><br>
+  <i>A MuJoCo Hopper controlled by our from-scratch PPO (≈3300 return) — the Phase&nbsp;1 milestone.</i>
+</p>
+
+**Status:** Phase 1 (RL foundations) — ✅ complete: Q-learning → REINFORCE → actor-critic → PPO+GAE, solving CartPole and the Hopper above. Phase 2 (simulation & control) next.
 
 ## Roadmap
 
