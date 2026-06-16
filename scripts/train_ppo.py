@@ -3,14 +3,15 @@ from __future__ import annotations
 import numpy as np
 
 from rlfoundations.algorithms.ppo import PPOAgent
-from rlfoundations.envs import make_env
+from rlfoundations.envs import make_env, make_vector_env
 from rlfoundations.utils.logging import Logger
 from rlfoundations.utils.seeding import set_seed
 
 # --- knobs (tune these) ---------------------------------------------------
 SEED = 0
 TOTAL_TIMESTEPS = 250_000
-NUM_STEPS = 512               # rollout horizon per iteration (= batch size, single env)
+NUM_ENVS = 4                  # parallel CartPoles (hand-rolled vector); batch = NUM_STEPS * NUM_ENVS
+NUM_STEPS = 128               # rollout horizon PER env per iteration (128 * 4 = 512 batch)
 HIDDEN_SIZES = (64, 64)       # CleanRL CartPole arch (Tanh trunk via networks.mlp)
 LR = 2.5e-4
 GAMMA = 0.99
@@ -51,12 +52,12 @@ def evaluate(agent: PPOAgent, env, n_episodes: int) -> list[float]:
 def main() -> None:
     set_seed(SEED)
 
-    env = make_env("CartPole-v1", seed=SEED)
+    envs = make_vector_env("CartPole-v1", NUM_ENVS, seed=SEED)
     eval_env = make_env("CartPole-v1", seed=SEED + 1000)
 
     agent = PPOAgent(
-        obs_dim=env.observation_space.shape[0],
-        n_actions=env.action_space.n,
+        obs_dim=envs[0].observation_space.shape[0],
+        n_actions=envs[0].action_space.n,
         hidden_sizes=HIDDEN_SIZES,
         lr=LR,
         gamma=GAMMA,
@@ -72,12 +73,14 @@ def main() -> None:
         orthogonal_init=ORTHOGONAL_INIT,
     )
 
-    num_iterations = TOTAL_TIMESTEPS // NUM_STEPS
+    num_iterations = TOTAL_TIMESTEPS // (NUM_STEPS * NUM_ENVS)
 
     config = {
         "algo": "ppo",
         "total_timesteps": TOTAL_TIMESTEPS,
+        "num_envs": NUM_ENVS,
         "num_steps": NUM_STEPS,
+        "batch_size": NUM_STEPS * NUM_ENVS,
         "num_iterations": num_iterations,
         "hidden_sizes": list(HIDDEN_SIZES),
         "lr": LR,
@@ -101,9 +104,9 @@ def main() -> None:
                 for pg in agent.optimizer.param_groups:
                     pg["lr"] = frac * LR
 
-            buffer, ep_returns = agent.collect_rollout(env, NUM_STEPS)
+            buffer, ep_returns = agent.collect_rollout(envs, NUM_STEPS)
             stats = agent.update(buffer)
-            global_step = iteration * NUM_STEPS
+            global_step = iteration * NUM_STEPS * NUM_ENVS
 
             metrics = dict(stats)
             metrics["lr"] = agent.optimizer.param_groups[0]["lr"]
@@ -124,7 +127,8 @@ def main() -> None:
         final_mean = float(np.mean(evaluate(agent, eval_env, FINAL_EVAL_EPISODES)))
         logger.run.summary["final_eval_mean_return"] = final_mean
 
-    env.close()
+    for env in envs:
+        env.close()
     eval_env.close()
 
     print(

@@ -60,17 +60,22 @@ class PPOAgent:
         return torch.as_tensor(x, dtype=torch.float32, device=self.device)
 
     @torch.no_grad()
-    def select_action(self, obs) -> tuple[int, float, float]:
-        """Rollout-time action: returns (action, log_prob, value) as plain numbers.
+    def select_action_batch(self, obs):
+        """Vectorized rollout-time step: obs [N, obs_dim] -> (actions, log_probs, values),
+        each a length-N numpy array.
 
-        No grad here — these are the *behaviour-policy* outputs we store in the
-        buffer (the "old" log-probs PPO clips against, and V(s_t) for GAE).
+        No grad — these are the *behaviour-policy* outputs stored in the buffer (the
+        "old" log-probs PPO clips against, and V(s_t) for GAE). One batched forward
+        through actor + critic serves all N envs at once (the throughput win).
         """
         obs_t = self._tensor(obs)
         dist = self.actor.distribution(obs_t)
-        action = dist.sample()
-        value = self.critic(obs_t)
-        return int(action.item()), float(dist.log_prob(action).item()), float(value.item())
+        actions = dist.sample()
+        return (
+            actions.cpu().numpy(),
+            dist.log_prob(actions).cpu().numpy(),
+            self.critic(obs_t).cpu().numpy(),
+        )
 
     @torch.no_grad()
     def act_greedy(self, obs) -> int:
@@ -88,7 +93,7 @@ class PPOAgent:
         """
         dist = self.actor.distribution(obs)
         return dist.log_prob(actions), dist.entropy(), self.critic(obs)
-
+    
     def compute_gae(
         self,
         rewards: torch.Tensor,
@@ -97,32 +102,26 @@ class PPOAgent:
         next_value: float,
         next_done: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generalized Advantage Estimation.
-
-        Returns:
-            advantages: A_t
-            returns:     A_t + V(s_t), used as critic targets
-        """
         advantages = torch.zeros_like(rewards)
 
-        last_gae = torch.zeros(
-            (),
-            dtype=rewards.dtype,
-            device=rewards.device,
+        # Convert next_value / next_done to tensors on the right device.
+        next_value = torch.as_tensor(
+        next_value,
+        dtype=values.dtype,
+        device=values.device,
         )
 
+        next_done = torch.as_tensor(
+        next_done,
+        dtype=dones.dtype,
+        device=dones.device,
+        )
+
+        last_gae = torch.zeros_like(rewards[0])
         for t in reversed(range(rewards.shape[0])):
             if t == rewards.shape[0] - 1:
-                next_nonterminal = 1.0 - torch.as_tensor(
-                    next_done,
-                    dtype=rewards.dtype,
-                    device=rewards.device,
-                )
-                next_values = torch.as_tensor(
-                    next_value,
-                    dtype=values.dtype,
-                    device=values.device,
-                )
+                next_nonterminal = 1.0 - next_done
+                next_values = next_value
             else:
                 next_nonterminal = 1.0 - dones[t + 1]
                 next_values = values[t + 1]
@@ -164,65 +163,67 @@ class PPOAgent:
 
         return -torch.min(unclipped, clipped).mean()
 
-    # --- plumbing: collect a fixed-horizon rollout ----------------------------
-    def collect_rollout(self, env, num_steps: int) -> tuple[dict, list[float]]:
-        """Step the env num_steps times under the current policy into a buffer.
+    # --- plumbing: collect a fixed-horizon rollout over N parallel envs --------
+    def collect_rollout(self, envs, num_steps: int) -> tuple[dict, list[float]]:
+        """Step each of the N envs `num_steps` times under the current policy.
 
-        Continuous across iterations: we do NOT reset between calls, so partial
-        episodes carry over and episode boundaries inside the buffer live in
-        `dones` (CleanRL convention: dones[t] = 1 if s_t was a fresh-reset state).
-        Also returns the list of completed-episode returns for logging.
+        Hand-rolled vector (envs is a plain list): we step every env and reset it
+        the instant it's done, so we keep full control of the truncation bootstrap
+        (gamma * V(s_T) folded into the reward, exactly as single-env) and never
+        touch Gymnasium's NEXT_STEP autoreset. Buffers are [num_steps, N]; episode
+        boundaries live per-env in `dones` (CleanRL convention: dones[t] = 1 if s_t
+        was a fresh-reset state). Continuous across iterations — env state persists
+        on the agent. Returns (buffer, completed-episode returns for logging).
         """
-        if self._next_obs is None:
-            obs, _ = env.reset()
-            self._next_obs = obs
-            self._next_done = 0.0
+        n_envs = len(envs)
+        obs_dim = envs[0].observation_space.shape[0]
 
-        obs_buf = np.zeros((num_steps, *np.shape(self._next_obs)), dtype=np.float32)
-        actions_buf = np.zeros(num_steps, dtype=np.int64)
-        logp_buf = np.zeros(num_steps, dtype=np.float32)
-        rewards_buf = np.zeros(num_steps, dtype=np.float32)
-        dones_buf = np.zeros(num_steps, dtype=np.float32)
-        values_buf = np.zeros(num_steps, dtype=np.float32)
+        if self._next_obs is None:
+            self._next_obs = np.stack([env.reset()[0] for env in envs]).astype(np.float32)
+            self._next_done = np.zeros(n_envs, dtype=np.float32)
+
+        obs_buf = np.zeros((num_steps, n_envs, obs_dim), dtype=np.float32)
+        actions_buf = np.zeros((num_steps, n_envs), dtype=np.int64)
+        logp_buf = np.zeros((num_steps, n_envs), dtype=np.float32)
+        rewards_buf = np.zeros((num_steps, n_envs), dtype=np.float32)
+        dones_buf = np.zeros((num_steps, n_envs), dtype=np.float32)
+        values_buf = np.zeros((num_steps, n_envs), dtype=np.float32)
 
         ep_returns: list[float] = []
-        ep_return = 0.0
+        ep_return = np.zeros(n_envs, dtype=np.float32)
 
         for t in range(num_steps):
             obs_buf[t] = self._next_obs
             dones_buf[t] = self._next_done
 
-            action, logp, value = self.select_action(self._next_obs)
-            actions_buf[t] = action
-            logp_buf[t] = logp
-            values_buf[t] = value
+            actions, logps, values = self.select_action_batch(self._next_obs)
+            actions_buf[t] = actions
+            logp_buf[t] = logps
+            values_buf[t] = values
 
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            rewards_buf[t] = reward
-            ep_return += reward
+            for i, env in enumerate(envs):
+                next_obs_i, reward, terminated, truncated, _ = env.step(int(actions[i]))
+                rewards_buf[t, i] = reward
+                ep_return[i] += reward
 
-            # Correct truncation handling: a time-limit truncation is NOT a real
-            # terminal state. Bootstrap the cut-off future value into this step's
-            # reward BEFORE the reset — GAE still masks the boundary via dones, so
-            # this just restores the missing gamma * V(s_T) term. Without it, every
-            # successful 500-step episode hands the critic a target of ~1 for a
-            # state actually worth tens, poisoning the value function exactly when
-            # the policy succeeds (the source of the oscillation in the first run).
-            if truncated and not terminated:
-                with torch.no_grad():
-                    rewards_buf[t] += self.gamma * float(self.critic(self._tensor(next_obs)).item())
+                # Per-env truncation bootstrap (same fix as single-env): a time-limit
+                # truncation is NOT a real terminal, so fold gamma * V(s_T) into the
+                # reward before resetting; GAE still masks the boundary via dones.
+                if truncated and not terminated:
+                    with torch.no_grad():
+                        rewards_buf[t, i] += self.gamma * float(self.critic(self._tensor(next_obs_i)).item())
 
-            if done:
-                ep_returns.append(ep_return)
-                ep_return = 0.0
-                next_obs, _ = env.reset()
+                done = terminated or truncated
+                if done:
+                    ep_returns.append(float(ep_return[i]))
+                    ep_return[i] = 0.0
+                    next_obs_i, _ = env.reset()
 
-            self._next_obs = next_obs
-            self._next_done = float(done)
+                self._next_obs[i] = next_obs_i
+                self._next_done[i] = float(done)
 
         with torch.no_grad():
-            next_value = float(self.critic(self._tensor(self._next_obs)).item())
+            next_value = self.critic(self._tensor(self._next_obs)).cpu().numpy()  # [N]
 
         buffer = {
             "obs": obs_buf,
@@ -232,7 +233,7 @@ class PPOAgent:
             "dones": dones_buf,
             "values": values_buf,
             "next_value": next_value,
-            "next_done": self._next_done,
+            "next_done": self._next_done.copy(),
         }
         return buffer, ep_returns
 
@@ -244,16 +245,25 @@ class PPOAgent:
         shuffles + slices the batch, re-scores each minibatch under the current
         policy, and steps the combined loss. Returns last-minibatch stats for logs.
         """
-        obs = self._tensor(buffer["obs"])
-        actions = torch.as_tensor(buffer["actions"], dtype=torch.long, device=self.device)
-        old_log_probs = self._tensor(buffer["log_probs"])
-        rewards = self._tensor(buffer["rewards"])
-        dones = self._tensor(buffer["dones"])
-        values = self._tensor(buffer["values"])
+        obs = self._tensor(buffer["obs"])                  # [T, N, obs_dim]
+        actions = torch.as_tensor(buffer["actions"], dtype=torch.long, device=self.device)  # [T, N]
+        old_log_probs = self._tensor(buffer["log_probs"])  # [T, N]
+        rewards = self._tensor(buffer["rewards"])           # [T, N]
+        dones = self._tensor(buffer["dones"])               # [T, N]
+        values = self._tensor(buffer["values"])             # [T, N]
 
+        # GAE runs on the [T, N] rollout (your compute_gae broadcasts over the env axis)
         advantages, returns = self.compute_gae(
             rewards, values, dones, buffer["next_value"], buffer["next_done"]
         )
+
+        # flatten [T, N] -> [T*N]: the env axis folds into the batch for minibatch SGD
+        obs = obs.reshape(-1, obs.shape[-1])
+        actions = actions.reshape(-1)
+        old_log_probs = old_log_probs.reshape(-1)
+        values = values.reshape(-1)
+        advantages = advantages.reshape(-1)
+        returns = returns.reshape(-1)
 
         batch_size = obs.shape[0]
         minibatch_size = batch_size // self.num_minibatches
