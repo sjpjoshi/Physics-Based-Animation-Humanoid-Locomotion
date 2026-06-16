@@ -17,7 +17,10 @@ top scores (~2500+) without normalization — that's the planned Hopper hardenin
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
+import torch
 
 from rlfoundations.algorithms.ppo import PPOAgent
 from rlfoundations.envs import make_env, make_vector_env
@@ -27,7 +30,7 @@ from rlfoundations.utils.seeding import set_seed
 # --- knobs (CleanRL ppo_continuous_action defaults) -----------------------
 SEED = 0
 ENV_ID = "Hopper-v5"
-TOTAL_TIMESTEPS = 1_000_000
+TOTAL_TIMESTEPS = int(os.environ.get("HOPPER_TIMESTEPS", 1_000_000))  # env override for quick runs
 NUM_ENVS = 1
 NUM_STEPS = 2048             # long rollouts, standard for continuous control
 HIDDEN_SIZES = (64, 64)
@@ -163,6 +166,23 @@ def main() -> None:
         f"\nFinal greedy eval: mean return {final_mean:.1f} over {FINAL_EVAL_EPISODES} episodes."
     )
     print("Hopper reference: random ~15, learning ~1000, strong ~2500+ (top scores need normalization).")
+
+    # save a checkpoint for rendering / reuse: actor weights + the obs normalizer
+    # (the policy was trained on normalized obs, so eval/render must normalize too)
+    os.makedirs("checkpoints", exist_ok=True)
+    torch.save(
+        {
+            "actor": agent.actor.state_dict(),
+            "obs_rms_mean": agent.obs_rms.mean if agent.obs_rms is not None else None,
+            "obs_rms_var": agent.obs_rms.var if agent.obs_rms is not None else None,
+            "obs_dim": obs_dim,
+            "action_dim": action_dim,
+            "hidden_sizes": list(HIDDEN_SIZES),
+            "final_eval": final_mean,
+        },
+        "checkpoints/hopper_ppo.pt",
+    )
+    print("saved checkpoint -> checkpoints/hopper_ppo.pt")
 
 
 if __name__ == "__main__":
