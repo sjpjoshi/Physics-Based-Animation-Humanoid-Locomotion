@@ -47,3 +47,24 @@ class CategoricalPolicy(nn.Module):
 
     def distribution(self, obs: torch.Tensor) -> torch.distributions.Categorical:
         return torch.distributions.Categorical(logits=self.forward(obs))
+
+
+class ValueNetwork(nn.Module):
+    """MLP state-value critic V(s).
+
+    A scalar value head on the same MLP trunk the policy uses. ``forward`` squeezes
+    off the trailing size-1 dimension, so a batch of observations ``[T, obs_dim]``
+    maps to a flat ``[T]`` of values (and a single observation to a 0-d scalar) —
+    shaped to line up directly with the returns-to-go in the actor-critic update.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden_sizes: Sequence[int] = (128,),
+    ) -> None:
+        super().__init__()
+        self.net = mlp([obs_dim, *hidden_sizes, 1])
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs).squeeze(-1)
