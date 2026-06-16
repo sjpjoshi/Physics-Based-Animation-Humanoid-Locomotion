@@ -94,3 +94,47 @@ class ValueNetwork(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.net(obs).squeeze(-1)
+
+
+class GaussianPolicy(nn.Module):
+    """Diagonal-Gaussian policy for continuous action spaces (Step 5 / Hopper).
+
+    The continuous analogue of CategoricalPolicy. An MLP maps the observation to the
+    action *mean*; a separate, state-independent log-std parameter (one per action
+    dim) sets the spread. ``forward`` returns the mean (also the deterministic action
+    used at eval); ``distribution`` (YOUR core) wraps (mean, std) into a distribution
+    whose .sample()/.log_prob()/.entropy() behave like CategoricalPolicy's — one
+    scalar per sample — so the PPO agent reuses them unchanged.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_sizes: Sequence[int] = (64, 64),
+        orthogonal_init: bool = False,
+    ) -> None:
+        super().__init__()
+        self.net = mlp(
+            [obs_dim, *hidden_sizes, action_dim],
+            orthogonal=orthogonal_init,
+            output_gain=0.01,  # small policy-head gain -> small initial action mean
+        )
+        # state-independent log-std (one per action dim) — the standard PPO choice
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Action mean mu(s). (Also the deterministic action used at eval.)"""
+        return self.net(obs)
+
+    def distribution(self, obs: torch.Tensor) -> torch.distributions.Distribution:
+        """The diagonal-Gaussian action distribution.
+
+        Returns an Independent Normal distribution so that vector-valued actions
+        have scalar log-probs / entropies per sample.
+        """
+        mean = self.forward(obs)
+        std = self.log_std.exp()
+
+        base_dist = torch.distributions.Normal(mean, std)
+        return torch.distributions.Independent(base_dist, 1)

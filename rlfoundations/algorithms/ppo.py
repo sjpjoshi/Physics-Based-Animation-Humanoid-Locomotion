@@ -6,14 +6,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from rlfoundations.networks import CategoricalPolicy, ValueNetwork
+from rlfoundations.networks import CategoricalPolicy, GaussianPolicy, ValueNetwork
 
 
 class PPOAgent:
     def __init__(
         self,
         obs_dim: int,
-        n_actions: int,
+        n_actions: int | None = None,
+        action_dim: int | None = None,
+        continuous: bool = False,
         hidden_sizes: Sequence[int] = (64, 64),
         lr: float = 2.5e-4,
         gamma: float = 0.99,
@@ -39,11 +41,18 @@ class PPOAgent:
         self.num_minibatches = num_minibatches
         self.normalize_advantages = normalize_advantages
         self.clip_vloss = clip_vloss
+        self.continuous = continuous
+        self.action_dim = action_dim
         self.device = torch.device(device)
 
-        self.actor = CategoricalPolicy(
-            obs_dim, n_actions, hidden_sizes, orthogonal_init=orthogonal_init
-        ).to(self.device)
+        if continuous:
+            self.actor = GaussianPolicy(
+                obs_dim, action_dim, hidden_sizes, orthogonal_init=orthogonal_init
+            ).to(self.device)
+        else:
+            self.actor = CategoricalPolicy(
+                obs_dim, n_actions, hidden_sizes, orthogonal_init=orthogonal_init
+            ).to(self.device)
         self.critic = ValueNetwork(
             obs_dim, hidden_sizes, orthogonal_init=orthogonal_init
         ).to(self.device)
@@ -78,8 +87,15 @@ class PPOAgent:
         )
 
     @torch.no_grad()
-    def act_greedy(self, obs) -> int:
-        """Deterministic argmax action — for evaluation."""
+    def act_greedy(self, obs):
+        """Deterministic action for evaluation: argmax (discrete) or the mean (continuous).
+
+        For continuous, GaussianPolicy's forward IS the mean; we clip it to the env's
+        [-1, 1] action box before returning (the same clip the rollout applies).
+        """
+        if self.continuous:
+            mean = self.actor(self._tensor(obs))
+            return np.clip(mean.cpu().numpy(), -1.0, 1.0)
         return int(self.actor(self._tensor(obs)).argmax(dim=-1).item())
 
     def evaluate_actions(
@@ -183,7 +199,10 @@ class PPOAgent:
             self._next_done = np.zeros(n_envs, dtype=np.float32)
 
         obs_buf = np.zeros((num_steps, n_envs, obs_dim), dtype=np.float32)
-        actions_buf = np.zeros((num_steps, n_envs), dtype=np.int64)
+        if self.continuous:
+            actions_buf = np.zeros((num_steps, n_envs, self.action_dim), dtype=np.float32)
+        else:
+            actions_buf = np.zeros((num_steps, n_envs), dtype=np.int64)
         logp_buf = np.zeros((num_steps, n_envs), dtype=np.float32)
         rewards_buf = np.zeros((num_steps, n_envs), dtype=np.float32)
         dones_buf = np.zeros((num_steps, n_envs), dtype=np.float32)
@@ -202,7 +221,10 @@ class PPOAgent:
             values_buf[t] = values
 
             for i, env in enumerate(envs):
-                next_obs_i, reward, terminated, truncated, _ = env.step(int(actions[i]))
+                # discrete: int action; continuous: clip the sampled vector to the
+                # env's [-1, 1] box (we store the UNCLIPPED action for the log-prob)
+                step_action = np.clip(actions[i], -1.0, 1.0) if self.continuous else int(actions[i])
+                next_obs_i, reward, terminated, truncated, _ = env.step(step_action)
                 rewards_buf[t, i] = reward
                 ep_return[i] += reward
 
@@ -246,7 +268,11 @@ class PPOAgent:
         policy, and steps the combined loss. Returns last-minibatch stats for logs.
         """
         obs = self._tensor(buffer["obs"])                  # [T, N, obs_dim]
-        actions = torch.as_tensor(buffer["actions"], dtype=torch.long, device=self.device)  # [T, N]
+        actions = torch.as_tensor(
+            buffer["actions"],
+            dtype=torch.float32 if self.continuous else torch.long,
+            device=self.device,
+        )  # [T, N] discrete; [T, N, action_dim] continuous
         old_log_probs = self._tensor(buffer["log_probs"])  # [T, N]
         rewards = self._tensor(buffer["rewards"])           # [T, N]
         dones = self._tensor(buffer["dones"])               # [T, N]
@@ -259,7 +285,7 @@ class PPOAgent:
 
         # flatten [T, N] -> [T*N]: the env axis folds into the batch for minibatch SGD
         obs = obs.reshape(-1, obs.shape[-1])
-        actions = actions.reshape(-1)
+        actions = actions.reshape(-1, self.action_dim) if self.continuous else actions.reshape(-1)
         old_log_probs = old_log_probs.reshape(-1)
         values = values.reshape(-1)
         advantages = advantages.reshape(-1)
