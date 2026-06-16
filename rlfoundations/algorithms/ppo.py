@@ -9,6 +9,40 @@ import torch.nn as nn
 from rlfoundations.networks import CategoricalPolicy, GaussianPolicy, ValueNetwork
 
 
+class RunningMeanStd:
+    """Running mean/variance (Welford parallel / Chan update) for obs normalization.
+
+    MuJoCo observations span very different scales (positions ~1, velocities much
+    larger), which makes a single MLP struggle. PPO standard practice (CleanRL, SB3)
+    normalizes observations by a running estimate of their mean/std. We keep it on
+    the agent so the SAME statistics normalize both rollout and eval — no separate
+    per-env wrapper to keep in sync.
+    """
+
+    def __init__(self, shape: tuple[int, ...], epsilon: float = 1e-4) -> None:
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon
+
+    def update(self, x: np.ndarray) -> None:
+        x = np.asarray(x, dtype=np.float64)
+        batch_mean = x.mean(axis=0)
+        batch_var = x.var(axis=0)
+        batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean += delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total
+        self.var = m2 / total
+        self.count = total
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return (np.asarray(x, dtype=np.float64) - self.mean) / np.sqrt(self.var + 1e-8)
+
+
 class PPOAgent:
     def __init__(
         self,
@@ -29,6 +63,7 @@ class PPOAgent:
         normalize_advantages: bool = True,
         clip_vloss: bool = True,
         orthogonal_init: bool = True,
+        normalize_obs: bool = False,
         device: str = "cpu",
     ) -> None:
         self.gamma = gamma
@@ -43,6 +78,8 @@ class PPOAgent:
         self.clip_vloss = clip_vloss
         self.continuous = continuous
         self.action_dim = action_dim
+        self.normalize_obs = normalize_obs
+        self.obs_rms = RunningMeanStd((obs_dim,)) if normalize_obs else None
         self.device = torch.device(device)
 
         if continuous:
@@ -67,6 +104,18 @@ class PPOAgent:
     # --- plumbing: tensors + action selection ---------------------------------
     def _tensor(self, x) -> torch.Tensor:
         return torch.as_tensor(x, dtype=torch.float32, device=self.device)
+
+    def _norm_obs(self, obs):
+        """Normalize observations with the running mean/std (no-op if disabled).
+
+        Applied everywhere the nets see an observation — rollout, truncation
+        bootstrap, eval — so all three share one normalizer. Does NOT update the
+        stats; collect_rollout owns the (training-only) updates, so eval uses frozen
+        stats.
+        """
+        if self.obs_rms is None:
+            return obs
+        return self.obs_rms.normalize(obs).astype(np.float32)
 
     @torch.no_grad()
     def select_action_batch(self, obs):
@@ -93,6 +142,7 @@ class PPOAgent:
         For continuous, GaussianPolicy's forward IS the mean; we clip it to the env's
         [-1, 1] action box before returning (the same clip the rollout applies).
         """
+        obs = self._norm_obs(obs)  # frozen stats — eval shares the training normalizer
         if self.continuous:
             mean = self.actor(self._tensor(obs))
             return np.clip(mean.cpu().numpy(), -1.0, 1.0)
@@ -212,10 +262,17 @@ class PPOAgent:
         ep_return = np.zeros(n_envs, dtype=np.float32)
 
         for t in range(num_steps):
-            obs_buf[t] = self._next_obs
+            # update obs stats with the RAW obs, then normalize for storage + policy.
+            # Storing the normalized obs keeps update() consistent (it re-feeds them
+            # without re-normalizing) — same contract as CleanRL's obs wrapper.
+            if self.obs_rms is not None:
+                self.obs_rms.update(self._next_obs)
+            norm_obs = self._norm_obs(self._next_obs)
+
+            obs_buf[t] = norm_obs
             dones_buf[t] = self._next_done
 
-            actions, logps, values = self.select_action_batch(self._next_obs)
+            actions, logps, values = self.select_action_batch(norm_obs)
             actions_buf[t] = actions
             logp_buf[t] = logps
             values_buf[t] = values
@@ -233,7 +290,8 @@ class PPOAgent:
                 # reward before resetting; GAE still masks the boundary via dones.
                 if truncated and not terminated:
                     with torch.no_grad():
-                        rewards_buf[t, i] += self.gamma * float(self.critic(self._tensor(next_obs_i)).item())
+                        boot_obs = self._norm_obs(next_obs_i)
+                        rewards_buf[t, i] += self.gamma * float(self.critic(self._tensor(boot_obs)).item())
 
                 done = terminated or truncated
                 if done:
@@ -245,7 +303,7 @@ class PPOAgent:
                 self._next_done[i] = float(done)
 
         with torch.no_grad():
-            next_value = self.critic(self._tensor(self._next_obs)).cpu().numpy()  # [N]
+            next_value = self.critic(self._tensor(self._norm_obs(self._next_obs))).cpu().numpy()  # [N]
 
         buffer = {
             "obs": obs_buf,
